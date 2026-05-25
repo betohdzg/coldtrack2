@@ -1,10 +1,14 @@
+import 'package:carnitrack2/models/alert.dart';
 import 'package:carnitrack2/screens/alerts_screen.dart';
+import 'package:carnitrack2/screens/charts_screen.dart';
 import 'package:carnitrack2/screens/login_screen.dart';
+import 'package:carnitrack2/services/notification_service.dart';
 import 'package:carnitrack2/screens/settings_screen.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
-import 'package:carnitrack2/sensores_screen.dart';
-import 'package:carnitrack2/models/alert.dart';
+import 'package:carnitrack2/screens/sensores_screen.dart';
+import 'package:intl/intl.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -16,49 +20,225 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int _selectedIndex = 0;
 
-  // Lista de alertas dinámicas
-  final List<AppAlert> _alerts = [
-    AppAlert(
-      id: '1',
-      title: 'Puerta abierta',
-      subtitle: 'Refrigerador Principal - Abierta por 8 minutos',
-      time: 'Hace 12 min',
-      priority: 'Alta',
-      icon: Icons.door_back_door,
-      color: Colors.red,
-    ),
-    AppAlert(
-      id: '2',
-      title: 'Temperatura crítica',
-      subtitle: 'Congelador Trasero - 6.8°C (fuera de rango)',
-      time: 'Hace 25 min',
-      priority: 'Crítica',
-      icon: Icons.thermostat,
-      color: Colors.orange,
-    ),
-  ];
+  final Set<String> _processedAlertIds = {};
+  final List<String> _refIds = ['ref01', 'ref02'];
 
-  late final List<Widget> _pages;
+  List<Map<String, dynamic>> _refrigeradores = [];
+  bool _isLoadingDashboard = true;
+
+  final List<AppAlert> _alerts = [];
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
 
   @override
   void initState() {
     super.initState();
-    _pages = [
-      const DashboardContent(),
-      const SensoresScreen(),
-      AlertsScreen(alerts: _alerts),
+    _listenToAllRefrigeradoresRealTime();
+    _listenToAlertasDeTodos();
+    _loadInitialData(); // ← nuevo
+  }
 
-      const SettingsScreen(),
-    ];
+  Future<void> _debugPrintAllReadings() async {
+    for (String refId in _refIds) {
+      final snapshot = await _dbRef
+          .child('sensores/refrigeradores/$refId/lecturas')
+          .get();
+      if (snapshot.value != null) {
+        final data = snapshot.value as Map<dynamic, dynamic>;
+        print('📚 Todas las lecturas para $refId:');
+        data.forEach((key, value) {
+          print('  $key -> Timestamp: ${value['Timestamp']}');
+        });
+      } else {
+        print('⚠️ No hay lecturas para $refId');
+      }
+    }
+  }
+
+  // ==================== ACTUALIZACIÓN EN TIEMPO REAL ====================
+  Future<void> _loadInitialData() async {
+    for (String refId in _refIds) {
+      final snapshot = await _dbRef
+          .child('sensores/refrigeradores/$refId/lecturas')
+          .get();
+      if (snapshot.value == null) continue;
+
+      final data = snapshot.value as Map<dynamic, dynamic>;
+      Map<String, dynamic>? ultimaLectura;
+      DateTime? ultimoTimestamp;
+
+      for (var entry in data.entries) {
+        final lectura = Map<String, dynamic>.from(entry.value as Map);
+        final tsStr = lectura['Timestamp']?.toString();
+        if (tsStr == null || tsStr.isEmpty) continue;
+
+        try {
+          final cleaned = tsStr.replaceAll(RegExp(r'^[A-Za-z]+ '), '').trim();
+          final fecha = DateFormat('dd.MM.yyyy -- HH:mm:ss').parse(cleaned);
+          if (ultimoTimestamp == null || fecha.isAfter(ultimoTimestamp)) {
+            ultimoTimestamp = fecha;
+            ultimaLectura = lectura;
+          }
+        } catch (e) {}
+      }
+
+      if (ultimaLectura != null && ultimoTimestamp != null) {
+        final temp =
+            double.tryParse(ultimaLectura['inTemp']?.toString() ?? '0') ?? 0.0;
+        final nuevoRefri = {
+          'id': refId,
+          'nombre': _nombreRefri(refId),
+          'tempInterior': temp.toStringAsFixed(1),
+          'consumo': ultimaLectura['ConsumoElectrico']?.toString() ?? '0',
+          'mantenimiento': ultimaLectura['falla_detectada'] == true ? '1' : '0',
+          'puerta': ultimaLectura['DoorStatus'] == 'DoorOPEN'
+              ? 'OPEN'
+              : 'CLOSED',
+          'compresor': ultimaLectura['CompressorStatus'] == 'CompressorON'
+              ? 'ON'
+              : 'OFF',
+          'power': 'ON',
+          'humedad': ultimaLectura['InHumid']?.toString() ?? 'N/A',
+          'timestamp': ultimoTimestamp.toIso8601String(),
+        };
+        // ✅ Actualiza si ya existe, agrega si es nuevo
+        setState(() {
+          final index = _refrigeradores.indexWhere((r) => r['id'] == refId);
+          if (index != -1) {
+            _refrigeradores[index] = nuevoRefri;
+          } else {
+            _refrigeradores.add(nuevoRefri);
+          }
+        });
+      }
+    }
+    setState(() => _isLoadingDashboard = false);
+  }
+
+  void _listenToAllRefrigeradoresRealTime() {
+    for (String refId in _refIds) {
+      _dbRef
+          .child('sensores/refrigeradores/$refId/lecturas')
+          .onChildAdded
+          .listen((event) {
+            final lectura = Map<String, dynamic>.from(
+              event.snapshot.value as Map,
+            );
+            final tsStr = lectura['Timestamp']?.toString();
+            if (tsStr == null || tsStr.isEmpty) return;
+
+            DateTime? fecha;
+            try {
+              final cleaned = tsStr
+                  .replaceAll(RegExp(r'^[A-Za-z]+ '), '')
+                  .trim();
+              fecha = DateFormat('dd.MM.yyyy -- HH:mm:ss').parse(cleaned);
+            } catch (e) {
+              return;
+            }
+            if (fecha == null) return;
+
+            // Verificar si ya tenemos un dato más reciente
+            final index = _refrigeradores.indexWhere((r) => r['id'] == refId);
+            bool necesitaActualizar = false;
+            if (index == -1) {
+              necesitaActualizar = true;
+            } else {
+              final fechaExistente = DateTime.tryParse(
+                _refrigeradores[index]['timestamp'] ?? '',
+              );
+              if (fechaExistente == null || fecha.isAfter(fechaExistente)) {
+                necesitaActualizar = true;
+              }
+            }
+
+            if (necesitaActualizar) {
+              final temp =
+                  double.tryParse(lectura['inTemp']?.toString() ?? '0') ?? 0.0;
+              final nuevoRefri = {
+                'id': refId,
+                'nombre': _nombreRefri(refId),
+                'tempInterior': temp.toStringAsFixed(1),
+                'consumo': lectura['ConsumoElectrico']?.toString() ?? '0',
+                'mantenimiento': lectura['falla_detectada'] == true ? '1' : '0',
+                'puerta': lectura['DoorStatus'] == 'DoorOPEN'
+                    ? 'OPEN'
+                    : 'CLOSED',
+                'compresor': lectura['CompressorStatus'] == 'CompressorON'
+                    ? 'ON'
+                    : 'OFF',
+                'power': 'ON',
+                'humedad': lectura['InHumid']?.toString() ?? 'N/A',
+                'timestamp': fecha.toIso8601String(),
+              };
+              setState(() {
+                if (index != -1) {
+                  _refrigeradores[index] = nuevoRefri;
+                } else {
+                  _refrigeradores.add(nuevoRefri);
+                }
+              });
+            }
+          });
+    }
+  }
+
+  void _setLoadingFalse() {
+    if (_isLoadingDashboard) {
+      setState(() => _isLoadingDashboard = false);
+    }
+  }
+
+  String _nombreRefri(String refId) =>
+      refId == 'ref01' ? 'Refrigerador Principal' : 'Congelador Trasero';
+
+  // ==================== ALERTAS ====================
+  void _listenToAlertasDeTodos() {
+    for (String refId in _refIds) {
+      _dbRef
+          .child('sensores')
+          .child('refrigeradores')
+          .child(refId)
+          .child('alertas')
+          .onChildAdded
+          .listen((event) {
+            final alertaId = event.snapshot.key;
+            if (alertaId == null ||
+                _processedAlertIds.contains('$refId-$alertaId'))
+              return;
+
+            _processedAlertIds.add('$refId-$alertaId');
+            final data = Map<String, dynamic>.from(event.snapshot.value as Map);
+            final nuevaAlerta = AppAlert.fromFirebase(data, alertaId, refId);
+
+            setState(() {
+              _alerts.insert(0, nuevaAlerta);
+            });
+
+            NotificationService.showNotification(
+              id: DateTime.now().millisecondsSinceEpoch % 100000,
+              title: nuevaAlerta.title,
+              body: '${nuevaAlerta.subtitle} (${_nombreRefri(refId)})',
+            );
+          });
+    }
+  }
+
+  // Necesario para AlertsScreen
+  void _updateAlerts() {
+    setState(() {});
+  }
+
+  // Necesario para RefreshIndicator del Dashboard
+  Future<void> _refreshDashboard() async {
+    // La escucha en tiempo real ya actualiza, pero forzamos un pequeño refresh visual
+    setState(() {});
   }
 
   int get unreadAlerts => _alerts.where((a) => !a.isRead).length;
 
   void _onItemTapped(int index) {
-    setState(() {
-      _selectedIndex = index;
-    });
-    Navigator.pop(context); // Cierra el drawer al seleccionar una opción
+    setState(() => _selectedIndex = index);
+    Navigator.pop(context);
   }
 
   @override
@@ -73,14 +253,13 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Container(
               padding: const EdgeInsets.all(6),
-              decoration: BoxDecoration(),
               child: Image.asset(
                 'assets/icon/coldtrack.png',
                 height: 86,
                 width: 56,
               ),
             ),
-            const SizedBox(width: 3), // Reducido para que quede más pegado
+            const SizedBox(width: 3),
             const Text(
               'ColdTrack',
               style: TextStyle(
@@ -93,34 +272,42 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         actions: [
           Builder(
-            builder: (context) {
-              return Stack(
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.menu, size: 28),
-                    onPressed: () => Scaffold.of(context).openDrawer(),
-                  ),
-                  // Punto rojo si hay alertas
-                  if (unreadAlerts > 0)
-                    Positioned(
-                      right: 10,
-                      top: 10,
-                      child: Container(
-                        width: 10,
-                        height: 10,
-                        decoration: const BoxDecoration(
-                          color: Colors.red,
-                          shape: BoxShape.circle,
+            builder: (context) => Stack(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.menu, size: 28),
+                  onPressed: () => Scaffold.of(context).openDrawer(),
+                ),
+                if (unreadAlerts > 0)
+                  Positioned(
+                    right: 8,
+                    top: 8,
+                    child: Container(
+                      padding: const EdgeInsets.all(2),
+                      decoration: const BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                      ),
+                      constraints: const BoxConstraints(
+                        minWidth: 18,
+                        minHeight: 18,
+                      ),
+                      child: Text(
+                        unreadAlerts > 99 ? '99+' : unreadAlerts.toString(),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
                         ),
+                        textAlign: TextAlign.center,
                       ),
                     ),
-                ],
-              );
-            },
+                  ),
+              ],
+            ),
           ),
         ],
       ),
-
       drawer: Drawer(
         child: ListView(
           padding: EdgeInsets.zero,
@@ -145,6 +332,19 @@ class _HomeScreenState extends State<HomeScreen> {
               onTap: () => _onItemTapped(1),
             ),
             ListTile(
+              leading: const Icon(Icons.show_chart),
+              title: const Text('Gráficas'),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const ChartsScreen(refrigeradorId: 'ref01'),
+                  ),
+                );
+              },
+            ),
+            ListTile(
               leading: const Icon(Icons.notifications),
               title: const Text('Alertas'),
               selected: _selectedIndex == 2,
@@ -160,13 +360,13 @@ class _HomeScreenState extends State<HomeScreen> {
                         style: const TextStyle(
                           color: Colors.white,
                           fontSize: 12,
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
                     )
                   : null,
               onTap: () => _onItemTapped(2),
             ),
-
             ExpansionTile(
               leading: const Icon(Icons.settings),
               title: const Text('Ajustes'),
@@ -176,7 +376,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   leading: const Icon(Icons.person),
                   title: const Text('Mi Perfil'),
                   onTap: () {
-                    Navigator.pop(context); // Cierra el drawer
+                    Navigator.pop(context);
                     Navigator.push(
                       context,
                       MaterialPageRoute(builder: (_) => const SettingsScreen()),
@@ -190,7 +390,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     style: TextStyle(color: Colors.red),
                   ),
                   onTap: () async {
-                    Navigator.pop(context); // Cierra el drawer
+                    Navigator.pop(context);
                     await FirebaseAuth.instance.signOut();
                     if (context.mounted) {
                       Navigator.pushAndRemoveUntil(
@@ -206,185 +406,269 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ),
-      body: IndexedStack(index: _selectedIndex, children: _pages),
+      body: IndexedStack(
+        index: _selectedIndex,
+        children: [
+          // Dentro del IndexedStack:
+          DashboardContent(
+            key: ValueKey(_refrigeradores.length),
+            refrigeradores: _refrigeradores,
+            isLoading: _isLoadingDashboard,
+            onRefresh: _refreshDashboard,
+          ),
+          const SensoresScreen(refrigeradorId: 'ref01'),
+          AlertsScreen(
+            alerts: _alerts,
+            onAlertsUpdated: _updateAlerts, // ← TAMBIÉN FALTABA
+          ),
+          const ChartsScreen(refrigeradorId: 'ref01'),
+          const SettingsScreen(),
+        ],
+      ),
     );
   }
 }
 
+/// ===================== TARJETAS VERTICALES ESTILO HISTORIAL (MODERNAS) =====================
 class DashboardContent extends StatelessWidget {
-  const DashboardContent({super.key});
+  final List<Map<String, dynamic>> refrigeradores;
+  final bool isLoading;
+  final VoidCallback onRefresh;
 
-  final List<Map<String, dynamic>> mockRefrigeradores = const [
-    {
-      'nombre': 'Refrigerador Principal',
-      'tempInterior': '4.7',
-      'consumo': '38.14',
-      'mantenimiento': '0',
-      'puerta': 'CLOSED',
-      'compresor': 'OFF',
-      'power': 'ON',
-      'color': Colors.green,
-    },
-    {
-      'nombre': 'Congelador Trasero',
-      'tempInterior': '1.8',
-      'consumo': '127.8',
-      'mantenimiento': '0',
-      'puerta': 'OPEN',
-      'compresor': 'ON',
-      'power': 'ON',
-      'color': Colors.orange,
-    },
-    {
-      'nombre': 'Cámara Maduración 1',
-      'tempInterior': '-14.0',
-      'consumo': '65.2',
-      'mantenimiento': '1',
-      'puerta': 'CLOSED',
-      'compresor': 'OFF',
-      'power': 'ON',
-      'color': Colors.blueGrey,
-    },
-  ];
+  const DashboardContent({
+    super.key,
+    required this.refrigeradores,
+    required this.isLoading,
+    required this.onRefresh,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'Mis Refrigeradores',
-            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 16),
-          GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              crossAxisSpacing: 12,
-              mainAxisSpacing: 12,
-              childAspectRatio: 0.65, // Ajustado para evitar overflow vertical
+    return RefreshIndicator(
+      onRefresh: () async => onRefresh(),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Mis Refrigeradores',
+              style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
             ),
-            itemCount: mockRefrigeradores.length,
-            itemBuilder: (context, index) {
-              final refri = mockRefrigeradores[index];
-              final temp = double.tryParse(refri['tempInterior']) ?? 0.0;
-              final estadoColor = temp >= 0 && temp <= 4
-                  ? Colors.green
-                  : temp > 4
-                  ? Colors.red
-                  : Colors.blue;
+            const SizedBox(height: 8),
+            Text(
+              '${refrigeradores.length} activos',
+              style: TextStyle(fontSize: 15, color: Colors.grey[600]),
+            ),
+            const SizedBox(height: 24),
 
-              return Card(
-                elevation: 3,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(
-                    12,
-                    12,
-                    12,
-                    8,
-                  ), // menos padding inferior
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Text(
-                        refri['nombre'],
-                        style: const TextStyle(
-                          fontSize: 13.5, // reducido para nombres largos
-                          fontWeight: FontWeight.bold,
-                          height: 1.2,
-                        ),
-                        textAlign: TextAlign.center,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      const SizedBox(height: 6),
-                      FittedBox(
-                        // ← evita que la temperatura desborde
-                        fit: BoxFit.scaleDown,
-                        child: Text(
-                          '${refri['tempInterior']}°C',
-                          style: TextStyle(
-                            fontSize: 36,
-                            fontWeight: FontWeight.bold,
-                            color: estadoColor,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Consumo: ${refri['consumo']}',
-                        style: const TextStyle(fontSize: 12.5),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      Text(
-                        'Mantto: ${refri['mantenimiento']}',
-                        style: const TextStyle(fontSize: 12.5),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          Icon(
-                            Icons.door_back_door,
-                            color: refri['puerta'] == 'CLOSED'
-                                ? Colors.green
-                                : Colors.red,
-                            size: 22,
-                          ),
-                          Icon(
-                            Icons.settings,
-                            color: refri['compresor'] == 'OFF'
-                                ? Colors.blue
-                                : Colors.orange,
-                            size: 22,
-                          ),
-                          Icon(
-                            Icons.power_settings_new,
-                            color: refri['power'] == 'ON'
-                                ? Colors.green
-                                : Colors.red,
-                            size: 22,
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          TextButton(
-                            onPressed: () {},
-                            child: const Text(
-                              'Gráfico',
-                              style: TextStyle(fontSize: 11.5),
-                            ),
-                          ),
-                          TextButton(
-                            onPressed: () {},
-                            child: const Text(
-                              'Config',
-                              style: TextStyle(fontSize: 11.5),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            },
-          ),
-          const SizedBox(height: 100), // espacio final para scroll cómodo
-        ],
+            if (isLoading)
+              const Center(child: CircularProgressIndicator())
+            else if (refrigeradores.isEmpty)
+              const Center(child: Text('No hay refrigeradores registrados'))
+            else
+              ListView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: refrigeradores.length,
+                itemBuilder: (context, index) =>
+                    _buildHistoryStyleCard(context, refrigeradores[index]),
+              ),
+            const SizedBox(height: 80),
+          ],
+        ),
       ),
     );
+  }
+
+  Widget _buildHistoryStyleCard(
+    BuildContext context,
+    Map<String, dynamic> refri,
+  ) {
+    final temp =
+        double.tryParse(refri['tempInterior']?.toString() ?? '0') ?? 0.0;
+    final tempColor = temp > 5
+        ? Colors.red
+        : (temp >= 0 && temp <= 4 ? Colors.green : Colors.orange);
+    final humedad = refri['humedad'] ?? '--';
+    final consumo = refri['consumo'] ?? '0';
+    final puertaEstado = refri['puerta'] == 'OPEN' ? 'ABIERTA' : 'CERRADA';
+    final compresorEstado = refri['compresor'] == 'ON' ? 'ON' : 'OFF';
+
+    final doorColor = puertaEstado == 'ABIERTA' ? Colors.red : Colors.green;
+    final compColor = compresorEstado == 'ON' ? Colors.orange : Colors.blue;
+
+    return Card(
+      elevation: 2, // ✅ valor fijo (sin isViewed)
+      margin: const EdgeInsets.only(bottom: 16),
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide.none,
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: () {
+          // Acción opcional al tocar la tarjeta
+        },
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Cabecera: nombre e icono
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Text(
+                      refri['nombre'],
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF1E293B),
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  Icon(Icons.kitchen, color: tempColor, size: 28),
+                ],
+              ),
+              const SizedBox(height: 16),
+              // Temperatura
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: tempColor.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Icon(Icons.thermostat, color: tempColor, size: 32),
+                  ),
+                  const SizedBox(width: 12),
+                  Text(
+                    '${refri['tempInterior']}°C',
+                    style: TextStyle(
+                      fontSize: 40,
+                      fontWeight: FontWeight.bold,
+                      color: tempColor,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              // Humedad
+              Row(
+                children: [
+                  Icon(Icons.water_drop_outlined, size: 22, color: Colors.blue),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Humedad: ${_formatHumedad(humedad)}%',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+              // Consumo
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Icon(Icons.electric_bolt, size: 22, color: Colors.amber),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Consumo: $consumo kWh',
+                    style: const TextStyle(fontSize: 16),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              // Indicadores de estado
+              Row(
+                children: [
+                  _buildStatusIcon(Icons.door_back_door, doorColor),
+                  const SizedBox(width: 16),
+                  _buildStatusIcon(Icons.settings, compColor),
+                  const Spacer(),
+                ],
+              ),
+              const SizedBox(height: 20),
+              // Botones
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                ChartsScreen(refrigeradorId: refri['id']),
+                          ),
+                        );
+                      },
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: tempColor,
+                        side: BorderSide(color: tempColor, width: 1.5),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      child: const Text('Gráfico'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                SensoresScreen(refrigeradorId: refri['id']),
+                          ),
+                        );
+                      },
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: tempColor,
+                        side: BorderSide(color: tempColor, width: 1.5),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      child: const Text('Historial'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusIcon(IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        shape: BoxShape.circle,
+      ),
+      child: Icon(icon, color: color, size: 20),
+    );
+  }
+
+  String _formatHumedad(String humedad) {
+    try {
+      final h = double.parse(humedad);
+      return h.toStringAsFixed(1);
+    } catch (_) {
+      return humedad;
+    }
   }
 }

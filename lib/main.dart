@@ -1,3 +1,4 @@
+import 'package:carnitrack2/services/notification_service.dart';
 import 'package:flutter/material.dart';
 import 'package:carnitrack2/screens/login_screen.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -8,6 +9,9 @@ void main() async {
   // 1. Asegura que Flutter esté listo antes de cualquier plugin nativo
   WidgetsFlutterBinding.ensureInitialized();
 
+  await Firebase.initializeApp();
+  await NotificationService.initialize();
+ await NotificationService.requestPermissions();
   // 2. Inicializa Firebase (esto debe ser await)
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(const ColdTrackApp());
